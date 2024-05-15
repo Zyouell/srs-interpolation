@@ -15,8 +15,8 @@ mod utils;
 // that is [1], [tau], [tau^2], [tau^3], ... [tau^d]. Since we are doing many point additions
 // we want to use the batch inversion trick and work in affine form to speed this up.
 
-/// This function performs batch affine addition on a series of pairs of affine points in short Weierstrass form.
-/// We assume the points have been arranged in a manner so that points to be added are adjacent to one another.
+/// This function takes a list of points in the SRS and converts them to the commitments to the Lagrange basis.
+/// It errors if the number of points is not a power of two.
 pub fn srs_to_lagrange<E, F>(points: &[Affine<E>]) -> Result<Vec<Affine<E>>, InterpolationError>
 where
     E: SWCurveConfig<ScalarField = F>,
@@ -67,6 +67,48 @@ where
         .collect())
 }
 
+/// This function takes a list of commitments to the Lagrange basis and converts them to the SRS.
+/// It errors if the number of points is not a power of two.
+pub fn lagrange_to_srs<E, F>(points: &[Affine<E>]) -> Result<Vec<Affine<E>>, InterpolationError>
+where
+    E: SWCurveConfig<ScalarField = F>,
+    F: PrimeField,
+{
+    // First we check that the number of points is a power of two.
+    let log_point_size = points.len().ilog2() as usize;
+    let point_size = 1usize << log_point_size;
+    if points.len() != point_size {
+        return Err(InterpolationError::SizeError);
+    }
+
+    if points.len() == 1 {
+        return Ok(points.to_vec());
+    }
+
+    // First we order the points so that it is convenient to perform the FFT style operation.
+    let mut ordered_points = cfg_into_iter!(0..points.len())
+        .map(|i| Ok(points[bit_reverse(i, log_point_size)?]))
+        .collect::<Result<Vec<Affine<E>>, InterpolationError>>()?;
+
+    // We need the |2^log_point_size|th root of unity in the field.
+    let domain =
+        Radix2EvaluationDomain::<F>::new(point_size).ok_or(InterpolationError::SizeError)?;
+    let gen = domain.group_gen();
+
+    // Then we perform the FFT style operation.
+    for i in 1..=log_point_size {
+        // In each round we take the point_size >> i th root of unity
+        let prim_root = gen.pow(&[(point_size >> i) as u64]);
+        if i != 1 {
+            fft_round::<E, F, false>(&mut ordered_points, prim_root, i)?;
+        } else {
+            fft_round::<E, F, true>(&mut ordered_points, prim_root, i)?;
+        }
+    }
+
+    Ok(ordered_points)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,8 +149,29 @@ mod tests {
         Ok(powers_of_g)
     }
 
+    fn test_fft_ifft_helper<E, F>()
+    where
+        E: SWCurveConfig<ScalarField = F>,
+        F: PrimeField,
+    {
+        let rng = &mut ark_std::test_rng();
+        for i in 5..10 {
+            let max_degree = (1usize << i) - 1;
+
+            let srs = gen_srs_for_testing::<E, _>(rng, max_degree).unwrap();
+
+            let lagrange_srs = srs_to_lagrange::<E, F>(&srs).unwrap();
+            let ifft_srs = lagrange_to_srs(&lagrange_srs).unwrap();
+
+            for (srs_point, calc_point) in srs.iter().zip(ifft_srs.iter()) {
+                assert_eq!(srs_point, calc_point);
+            }
+        }
+    }
+
     #[test]
     fn test_srs_interpolation() -> Result<(), InterpolationError> {
+        test_fft_ifft_helper::<BnConfig, Fr>();
         test_srs_interpolation_helper::<BnConfig, Fr>();
         Ok(())
     }
