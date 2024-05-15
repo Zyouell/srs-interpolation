@@ -6,6 +6,7 @@ use ark_ec::{
 };
 use ark_ff::{Field, PrimeField};
 use ark_std::{cfg_chunks_mut, vec::Vec, One, Zero};
+
 use rayon::prelude::*;
 
 /// This table is used as a lookup for swapping 8 bits into their reverse order.
@@ -70,32 +71,35 @@ where
 {
     let k = 1usize << round_number;
     let half = k >> 1;
-    ark_std::println!("k: {}", k);
-
+    // If its the first round we don't have to rescale any points
     if !IS_FIRST_ROUND {
         cfg_chunks_mut!(points, k).try_for_each(|points: &mut [Affine<E>]| {
-            distribute_powers(points, g);
+            distribute_powers(&mut points[half..], g);
             Result::<(), InterpolationError>::Ok(())
         })?;
     }
     let len = points.len() / k;
-    ark_std::println!("len: {}", len);
+
     let mut batch_inversion_accumulator = E::BaseField::one();
-    let mut scratch: Vec<E::BaseField> = vec![E::BaseField::zero(); len * half];
+    let mut scratch_x: Vec<E::BaseField> = vec![E::BaseField::zero(); len * half];
+    let mut scratch_y: Vec<E::BaseField> = vec![E::BaseField::zero(); len * half];
     points
         .chunks_mut(k)
         .enumerate()
         .for_each(|(i, points_chunk): (usize, &mut [Affine<E>])| {
-            ark_std::println!("i: {}", i);
             for j in 0..half {
                 // We store the sum of the two x-coordinates in the scratch space
-                scratch[half * i + j] += points_chunk[j].x + points_chunk[j + half].x;
+                scratch_x[half * i + j] += points_chunk[j].x + points_chunk[j + half].x;
+                // Store y2 - y1 in the y scratch space
+                scratch_y[half * i + j] += points_chunk[j + half].y - points_chunk[j].y;
                 // Store x2 - x1 in the second points x-coordinate
                 points_chunk[j + half].x -= points_chunk[j].x;
-                // Store y2 - y1 in the second points y-coordinate
-                points_chunk[j + half].y -= points_chunk[j].y;
-                // Multiply (y2 - y1) by the product of the delta x's so far.
-                points_chunk[j + half].y *= batch_inversion_accumulator;
+                // Store y2 + y1 in the second points y-coordinate
+                points_chunk[j + half].y += points_chunk[j].y;
+                // Multiply y2 + y1 by the product of the delta x's so far.
+                points_chunk[j + half].y *= -batch_inversion_accumulator;
+                // Multiply y2 - y1 by the product of the delta x's so far.
+                scratch_y[half * i + j] *= batch_inversion_accumulator;
                 // Update the accumulator with the denominator from this round.
                 batch_inversion_accumulator *= points_chunk[j + half].x;
             }
@@ -111,16 +115,26 @@ where
     points.chunks_mut(k).enumerate().rev().for_each(
         |(i, points_chunk): (usize, &mut [Affine<E>])| {
             for j in (0..half).rev() {
+                // Store (y2 + y1) / (x2 - x1) in the y-coordinate of the second point
                 points_chunk[j + half].y *= batch_inversion_accumulator;
+                // Store (y2 - y1) / (x2 - x1) in the y scratch space
+                scratch_y[half * i + j] *= batch_inversion_accumulator;
+                // Update the inversion accumulator
                 batch_inversion_accumulator *= points_chunk[j + half].x;
-                points_chunk[j + half].x = points_chunk[j + half].y * points_chunk[j + half].y;
-                points_chunk[j].x = points_chunk[j + half].x - scratch[half * (len - i) - 1 + j];
-                points_chunk[j + half].x = points_chunk[j].x;
 
-                points_chunk[j].x *= points_chunk[j + half].y;
-                points_chunk[j + half].x *= points_chunk[j].y;
-                points_chunk[j].y = points_chunk[j].x - points_chunk[j].y;
-                points_chunk[j + half].y = -points_chunk[j].x + points_chunk[j].y;
+                // Calculate new x and y coordinates for P - Q.
+                points_chunk[j + half].x =
+                    points_chunk[j + half].y * points_chunk[j + half].y - scratch_x[half * i + j];
+                points_chunk[j + half].y = points_chunk[j + half].y
+                    * (points_chunk[j].x - points_chunk[j + half].x)
+                    - points_chunk[j].y;
+
+                // Calculate new x and y coordinates for P + Q.
+                let x = points_chunk[j].x;
+                points_chunk[j].x =
+                    scratch_y[half * i + j] * scratch_y[half * i + j] - scratch_x[half * i + j];
+                points_chunk[j].y =
+                    scratch_y[half * i + j] * (x - points_chunk[j].x) - points_chunk[j].y;
             }
         },
     );

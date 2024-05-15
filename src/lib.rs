@@ -5,7 +5,7 @@ use ark_ec::{
 
 use ark_ff::PrimeField;
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
-use ark_std::cfg_iter;
+use ark_std::{cfg_into_iter, cfg_iter};
 use error::InterpolationError;
 use rayon::prelude::*;
 use utils::{bit_reverse, fft_round};
@@ -34,18 +34,19 @@ where
     }
 
     // First we order the points so that it is convenient to perform the FFT style operation.
-    let mut ordered_points = (0..points.len())
+    let mut ordered_points = cfg_into_iter!(0..points.len())
         .map(|i| Ok(points[bit_reverse(i, log_point_size)?]))
         .collect::<Result<Vec<Affine<E>>, InterpolationError>>()?;
 
     // We need the |2^log_point_size|th root of unity in the field.
     let domain =
         Radix2EvaluationDomain::<F>::new(point_size).ok_or(InterpolationError::SizeError)?;
+    let gen = domain.group_gen_inv();
 
     // Then we perform the FFT style operation.
-    for i in 1..=log_point_size - 1 {
-        let prim_root = domain.element(1 << i);
-
+    for i in 1..=log_point_size {
+        // In each round we take the point_size >> i th root of unity
+        let prim_root = gen.pow(&[(point_size >> i) as u64]);
         if i != 1 {
             fft_round::<E, F, false>(&mut ordered_points, prim_root, i)?;
         } else {
@@ -118,29 +119,17 @@ mod tests {
         F: PrimeField,
     {
         let rng = &mut ark_std::test_rng();
-        for i in 1..3 {
+        for i in 5..10 {
             let max_degree = (1usize << i) - 1;
-            ark_std::println!("max_degree: {}", max_degree);
-            let domain = Radix2EvaluationDomain::<F>::new(max_degree).unwrap();
+
+            let domain = Radix2EvaluationDomain::<F>::new(max_degree + 1).unwrap();
             let srs = gen_srs_for_testing::<E, _>(rng, max_degree).unwrap();
-            let srs_len = srs.len();
-            ark_std::println!("srs length: {}", srs.len());
 
-            if srs_len == 2 {
-                let two_inv = F::from(2u8).inverse().unwrap();
-                let point_one = ((srs[0] + srs[1]) * two_inv).into_affine();
-                let point_two = ((srs[0] - srs[1]) * two_inv).into_affine();
-                ark_std::println!(
-                    "expected interpolated srs[0]: {}, 
-                srs[1]: {}",
-                    point_one,
-                    point_two
-                );
-            }
-            let evals = (0..max_degree).map(|_| F::rand(rng)).collect::<Vec<F>>();
-            let mut coeffs = evals.clone();
+            let evals = (0..(max_degree + 1))
+                .map(|_| F::rand(rng))
+                .collect::<Vec<F>>();
 
-            domain.ifft_in_place(&mut coeffs);
+            let coeffs = domain.ifft(&evals);
 
             let coeff_commitment = Projective::<E>::msm_bigint(
                 &srs,
@@ -150,13 +139,6 @@ mod tests {
 
             let lagrange_srs = srs_to_lagrange::<E, F>(&srs).unwrap();
 
-            if srs_len == 2 {
-                ark_std::println!(
-                    "interpolated srs[0]: {}, srs[1]: {}",
-                    lagrange_srs[0],
-                    lagrange_srs[1]
-                );
-            }
             let lagrange_commitment = Projective::<E>::msm_bigint(
                 &lagrange_srs,
                 &evals.iter().map(|x| x.into_bigint()).collect::<Vec<_>>(),

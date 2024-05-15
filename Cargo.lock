@@ -369,6 +369,7 @@ dependencies = [
  "ark-ff",
  "ark-poly",
  "ark-std",
+ "itertools",
  "rayon",
 ]
 
